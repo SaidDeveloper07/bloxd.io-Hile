@@ -1,1 +1,1 @@
-# Bu Yer Blooket Hile
+% Burda Bloxd.io Hilesi var
