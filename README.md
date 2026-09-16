@@ -1,1 +1,1 @@
-% Burda Bloxd.io Hilesi var
+# Burda Bloxd.io Hilesi var
