@@ -1,0 +1,643 @@
+// ==UserScript==
+// @name         said Bloxd Full
+// @namespace    said
+// @version      2.0.0
+// @description  said | Aimbot Head | Box ESP | Fly | Killaura | multi-inject
+// @author       said
+// @match        *://*.bloxd.io/*
+// @match        *://*.bloxd.com/*
+// @match        *://*.bloxd.dev/*
+// @match        *://*.bloxdhop.io/*
+// @match        *://*.bloxdunblocked.*/*
+// @match        *://*.playbloxd.com/*
+// @match        *://*.eviltower.io/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  const { defineProperty, keys, values, getPrototypeOf, getOwnPropertyNames } = Object;
+  const { hypot, atan2, sin, cos, abs, min, max, random, PI, floor } = Math;
+
+  const CFG = {
+    name: "said",
+    aimSmooth: 0.55,
+    aimFov: 160,
+    aimRange: 28,
+    aimDelay: 8,
+    kaRange: 7.0,
+    kaDelay: 55,
+    kaJitter: 0.25,
+    flySpeed: 0.45,
+    boxColor: "rgba(255,45,45,0.95)",
+    panelW: 220
+  };
+
+  const state = {
+    aimbot: false,
+    esp: false,
+    fly: false,
+    killaura: false,
+    invfill: false,
+    _kaLast: 0,
+    _aimLast: 0,
+    menuOpen: true
+  };
+
+  const keysDown = { space: false, shift: false, w: false, a: false, s: false, d: false };
+
+  const utils = {
+    attempt(fn, fb = null) {
+      try { return fn(); } catch { return fb; }
+    },
+    angleDiff(a, b) {
+      return atan2(sin(a - b), cos(a - b));
+    },
+    dist(a, b) {
+      if (!a || !b) return 1e9;
+      return hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+    }
+  };
+
+  // ═══════════════════════════════════════════════════════════
+  // MULTI INJECT — 3 yöntem (v1.5.3 + webpack + window scan)
+  // ═══════════════════════════════════════════════════════════
+  const hooks = {
+    noa: null,
+    injected: false,
+    method: ""
+  };
+
+  function onNoa(n, method) {
+    if (hooks.injected || !n || !n.entities) return;
+    hooks.noa = n;
+    hooks.injected = true;
+    hooks.method = method;
+    window.noa = n;
+    console.log("%c[said]%c injected via " + method, "background:#000;color:#fff;padding:2px 6px", "color:#0f0");
+    setStatus(true);
+  }
+
+  // Method A: Function.prototype.call hijack (Click Helper 1.5.3)
+  (function injectCall() {
+    let captured = false;
+    const orig = Function.prototype.call;
+    defineProperty(Function.prototype, "call", {
+      enumerable: false,
+      configurable: true,
+      writable: true,
+      value: function (thisArg, ...args) {
+        if (!captured) {
+          const c = args[0];
+          if (c && c.entities && c.bloxd) {
+            captured = true;
+            onNoa(c, "call-hijack");
+            defineProperty(Function.prototype, "call", { value: orig, writable: true, configurable: true });
+          }
+        }
+        return orig.apply(this, [thisArg, ...args]);
+      }
+    });
+  })();
+
+  // Method B: webpackChunkbloxd push
+  (function injectWebpack() {
+    try {
+      window.webpackChunkbloxd = window.webpackChunkbloxd || [];
+      const origPush = window.webpackChunkbloxd.push.bind(window.webpackChunkbloxd);
+      window.webpackChunkbloxd.push = function (...args) {
+        try {
+          const mod = args[0] && args[0][2];
+          if (typeof mod === "function") {
+            // scan later via interval
+          }
+        } catch {}
+        return origPush(...args);
+      };
+    } catch {}
+  })();
+
+  // Method C: periodic window / noa scan
+  setInterval(() => {
+    if (hooks.injected) return;
+    if (window.noa && window.noa.entities && window.noa.bloxd) {
+      onNoa(window.noa, "window.noa");
+      return;
+    }
+    // deep scan common globals
+    try {
+      for (const k of keys(window)) {
+        const v = window[k];
+        if (v && typeof v === "object" && v.entities && v.bloxd && v.camera) {
+          onNoa(v, "window-scan:" + k);
+          return;
+        }
+      }
+    } catch {}
+  }, 800);
+
+  // ═══════════════════════════════════════════════════════════
+  // GAME API — güncel offset path’ler (Temmuz–Eylül 2026)
+  // ═══════════════════════════════════════════════════════════
+  const game = {
+    _heldCache: null,
+    _attackCache: new WeakMap(),
+
+    inGame() {
+      return !!(hooks.noa && hooks.noa.bloxd && hooks.noa.bloxd.client && hooks.noa.bloxd.client.msgHandler);
+    },
+
+    state(id, comp) {
+      return utils.attempt(() => hooks.noa.entities.getState(id, comp));
+    },
+
+    // position component
+    getPos(id = 1) {
+      return utils.attempt(() => {
+        const s = hooks.noa.entities.getState(id, "position");
+        return s && s.position ? s.position : null;
+      });
+    },
+
+    isAlive(id = 1) {
+      return utils.attempt(() => {
+        const s = hooks.noa.entities.getState(id, "genericLifeformState");
+        return s ? s.isAlive !== false : true;
+      }, true);
+    },
+
+    getPlayerIds() {
+      return utils.attempt(() => {
+        const raw = hooks.noa.bloxd.getPlayerIds ? hooks.noa.bloxd.getPlayerIds() : {};
+        return values(raw).map(Number).filter((n) => n && n !== 1);
+      }, []);
+    },
+
+    getAlivePlayers() {
+      return this.getPlayerIds().filter((id) => this.isAlive(id));
+    },
+
+    // held item — iki yol: component scan + function scan
+    getHeld(id = 1) {
+      if (!hooks.noa) return null;
+      return utils.attempt(() => {
+        // yol 1: components içinde fistItem
+        try {
+          const comps = hooks.noa.entities.components;
+          if (comps) {
+            const comp = values(comps).find((c) => {
+              try {
+                return values(c).some((v) => v && typeof v === "object" && "fistItem" in v);
+              } catch { return false; }
+            });
+            if (comp && comp.name) {
+              return hooks.noa.entities.getState(id, comp.name);
+            }
+          }
+        } catch {}
+        // yol 2: entities üzerinde kısa function
+        if (!this._heldCache) {
+          this._heldCache = values(hooks.noa.entities).find((fn) => {
+            if (typeof fn !== "function" || fn.length !== 1) return false;
+            const s = String(fn);
+            return s.length < 90 && s.includes(").") && !s.includes("opWrapper");
+          });
+        }
+        return this._heldCache ? this._heldCache(id) : null;
+      });
+    },
+
+    // swing
+    doSwing() {
+      utils.attempt(() => {
+        const held = this.getHeld(1);
+        const std = held && (held._standardItem || (held.heldItemState && held.heldItemState._standardItem));
+        if (std && typeof std.trySwingBlock === "function") std.trySwingBlock(Date.now());
+        const ms = this.state(1, "moveState");
+        if (ms && typeof ms.setArmsAreSwinging === "function") ms.setArmsAreSwinging(true);
+      });
+    },
+
+    // ATTACK — güncel: fistItem proto canAttack + BodyMesh
+    doAttack(targetId) {
+      utils.attempt(() => {
+        const held = this.getHeld(1);
+        if (!held) return;
+
+        // fistItem tercih
+        const fist =
+          held.fistItem ||
+          (held.heldItemState && held.heldItemState.fistItem) ||
+          held;
+
+        let attackFn = null;
+        const proto = getPrototypeOf(fist);
+        if (proto && this._attackCache.has(proto)) {
+          attackFn = this._attackCache.get(proto);
+        } else if (proto) {
+          attackFn = getOwnPropertyNames(proto)
+            .map((k) => fist[k])
+            .find((f) => typeof f === "function" && f.length === 3 && String(f).includes("canAttack"));
+          if (!attackFn) {
+            attackFn =
+              (typeof fist.doAttack === "function" && fist.doAttack) ||
+              (fist.breakingItem && fist.breakingItem.doAttack) ||
+              null;
+          }
+          if (attackFn) this._attackCache.set(proto, attackFn);
+        }
+
+        if (typeof attackFn !== "function") return;
+
+        const self = this.getPos(1);
+        const targ = this.getPos(targetId);
+        if (!self || !targ) return;
+
+        let dx = targ[0] - self[0];
+        let dy = targ[1] - self[1] + 1.0; // gövde / kafa arası
+        let dz = targ[2] - self[2];
+        const d = hypot(dx, dy, dz) || 1;
+
+        // jitter
+        const j = CFG.kaJitter;
+        if (j > 0) {
+          dx += (random() - 0.5) * j;
+          dy += (random() - 0.5) * j * 0.5;
+          dz += (random() - 0.5) * j;
+        }
+
+        const dir = [dx / d, dy / d, dz / d];
+
+        // mesh sırası: BodyMesh (güncel) → HeadMesh → boş
+        try {
+          attackFn.call(fist, dir, String(targetId), "BodyMesh");
+        } catch {
+          try {
+            attackFn.call(fist, dir, String(targetId), "HeadMesh");
+          } catch {
+            try {
+              attackFn.call(fist, dir, String(targetId));
+            } catch {}
+          }
+        }
+        this.doSwing();
+      });
+    },
+
+    getCam() {
+      return hooks.noa && hooks.noa.camera ? hooks.noa.camera : null;
+    },
+
+    getPhysicsBody() {
+      return utils.attempt(() => hooks.noa.entities.getPhysics(1).body);
+    },
+
+    fireInput(action, down) {
+      utils.attempt(() => {
+        const inp = hooks.noa.inputs;
+        if (!inp) return;
+        const bucket = down ? inp.down : inp.up;
+        if (bucket && typeof bucket.emit === "function") {
+          bucket.emit(action, {
+            timeStamp: performance.now(),
+            preventDefault() {},
+            stopPropagation() {}
+          });
+        }
+      });
+    }
+  };
+
+  // ═══════════════════════════════════════════════════════════
+  // MODULES
+  // ═══════════════════════════════════════════════════════════
+  function tickAimbot() {
+    if (!state.aimbot || !game.inGame()) return;
+    const now = Date.now();
+    if (now - state._aimLast < CFG.aimDelay) return;
+    state._aimLast = now;
+
+    const self = game.getPos(1);
+    const cam = game.getCam();
+    if (!self || !cam) return;
+
+    const fovRad = (CFG.aimFov * PI) / 180;
+    let best = null;
+    let bestD = CFG.aimRange;
+
+    for (const id of game.getAlivePlayers()) {
+      const p = game.getPos(id);
+      if (!p) continue;
+      const d = utils.dist(self, p);
+      if (d >= bestD) continue;
+      const yaw = atan2(p[0] - self[0], p[2] - self[2]);
+      if (abs(utils.angleDiff(yaw, cam.heading)) > fovRad / 2) continue;
+      bestD = d;
+      best = p;
+    }
+    if (!best) return;
+
+    // kafa: y + 1.55
+    const hx = best[0] - self[0];
+    const hy = best[1] + 1.55 - self[1];
+    const hz = best[2] - self[2];
+    const wantYaw = atan2(hx, hz);
+    const wantPitch = -atan2(hy, hypot(hx, hz));
+
+    cam.heading += utils.angleDiff(wantYaw, cam.heading) * CFG.aimSmooth;
+    cam.pitch += (max(-1.55, min(1.55, wantPitch)) - cam.pitch) * CFG.aimSmooth;
+  }
+
+  function tickKillaura() {
+    if (!state.killaura || !game.inGame()) return;
+    const now = Date.now();
+    if (now - state._kaLast < CFG.kaDelay) return;
+
+    const self = game.getPos(1);
+    if (!self) return;
+
+    let closest = null;
+    let closestD = CFG.kaRange;
+    for (const id of game.getAlivePlayers()) {
+      const p = game.getPos(id);
+      if (!p) continue;
+      const d = utils.dist(self, p);
+      if (d < closestD) {
+        closestD = d;
+        closest = id;
+      }
+    }
+    if (closest != null) {
+      state._kaLast = now;
+      game.doAttack(closest);
+    }
+  }
+
+  function tickFly() {
+    if (!state.fly || !game.inGame()) return;
+    const body = game.getPhysicsBody();
+    if (!body || !body.velocity) return;
+
+    if (keysDown.space) body.velocity[1] = CFG.flySpeed * 14;
+    else if (keysDown.shift) body.velocity[1] = -CFG.flySpeed * 14;
+    else body.velocity[1] = 0;
+
+    const cam = game.getCam();
+    if (!cam) return;
+    let mx = 0, mz = 0;
+    if (keysDown.w) { mx += sin(cam.heading); mz += cos(cam.heading); }
+    if (keysDown.s) { mx -= sin(cam.heading); mz -= cos(cam.heading); }
+    if (keysDown.a) { mx += cos(cam.heading); mz -= sin(cam.heading); }
+    if (keysDown.d) { mx -= cos(cam.heading); mz += sin(cam.heading); }
+    const len = hypot(mx, mz) || 1;
+    body.velocity[0] = (mx / len) * CFG.flySpeed * 12;
+    body.velocity[2] = (mz / len) * CFG.flySpeed * 12;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // BOX ESP
+  // ═══════════════════════════════════════════════════════════
+  let espCanvas, espCtx;
+
+  function ensureEsp() {
+    if (espCanvas) return;
+    espCanvas = document.createElement("canvas");
+    espCanvas.id = "said-esp";
+    espCanvas.style.cssText = "position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:9998;";
+    (document.body || document.documentElement).appendChild(espCanvas);
+    espCtx = espCanvas.getContext("2d");
+    const resize = () => {
+      espCanvas.width = innerWidth;
+      espCanvas.height = innerHeight;
+    };
+    resize();
+    addEventListener("resize", resize);
+  }
+
+  function worldToScreen(pos) {
+    const cam = game.getCam();
+    const self = game.getPos(1);
+    if (!cam || !self || !pos || !espCanvas) return null;
+
+    const dx = pos[0] - self[0];
+    const dy = pos[1] - self[1];
+    const dz = pos[2] - self[2];
+
+    const cosH = cos(-cam.heading), sinH = sin(-cam.heading);
+    const cosP = cos(-cam.pitch), sinP = sin(-cam.pitch);
+
+    let x = dx * cosH - dz * sinH;
+    let z = dx * sinH + dz * cosH;
+    let y = dy;
+    const y2 = y * cosP - z * sinP;
+    const z2 = y * sinP + z * cosP;
+    if (z2 <= 0.15) return null;
+
+    const fov = (70 * PI) / 180;
+    const scale = espCanvas.height / 2 / Math.tan(fov / 2);
+    return {
+      x: espCanvas.width / 2 + (x / z2) * scale,
+      y: espCanvas.height / 2 - (y2 / z2) * scale
+    };
+  }
+
+  function drawEsp() {
+    if (!espCtx) return;
+    espCtx.clearRect(0, 0, espCanvas.width, espCanvas.height);
+    if (!state.esp || !game.inGame()) return;
+
+    espCtx.strokeStyle = CFG.boxColor;
+    espCtx.lineWidth = 2;
+    espCtx.font = "11px monospace";
+    espCtx.fillStyle = CFG.boxColor;
+
+    for (const id of game.getAlivePlayers()) {
+      const p = game.getPos(id);
+      if (!p) continue;
+      const foot = worldToScreen(p);
+      const head = worldToScreen([p[0], p[1] + 1.7, p[2]]);
+      if (!foot || !head) continue;
+      const h = abs(foot.y - head.y);
+      const w = h * 0.45;
+      const cx = (foot.x + head.x) / 2;
+      const top = min(foot.y, head.y);
+      espCtx.strokeRect(cx - w / 2, top, w, h);
+      espCtx.fillText("#" + id, cx - w / 2, top - 3);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // UI — siyah dikey panel + daire
+  // ═══════════════════════════════════════════════════════════
+  let statusDot, statusTxt;
+
+  function setStatus(ok) {
+    if (!statusDot) return;
+    statusDot.style.background = ok ? "#0f0" : "#f33";
+    if (statusTxt) statusTxt.textContent = ok ? "in-game · " + hooks.method : "waiting…";
+  }
+
+  function buildUI() {
+    if (document.getElementById("said-root")) return;
+
+    const css = document.createElement("style");
+    css.textContent = `
+      #said-root{font-family:monospace;user-select:none;-webkit-user-select:none}
+      #said-panel{
+        position:fixed;top:70px;right:14px;width:${CFG.panelW}px;z-index:10000;
+        background:rgba(6,6,6,0.97);border:1px solid #1a1a1a;border-radius:10px;
+        color:#fff;box-shadow:0 10px 40px rgba(0,0,0,0.6);overflow:hidden
+      }
+      #said-head{
+        padding:10px 12px;background:#000;border-bottom:1px solid #222;
+        display:flex;align-items:center;justify-content:space-between;cursor:move
+      }
+      #said-head b{letter-spacing:1px}
+      #said-close{
+        width:22px;height:22px;border-radius:50%;background:#111;border:1px solid #333;
+        display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px
+      }
+      #said-body{padding:8px 10px 12px;display:flex;flex-direction:column;gap:6px}
+      .said-row{
+        display:flex;align-items:center;justify-content:space-between;
+        padding:9px 10px;background:#0c0c0c;border:1px solid #1c1c1c;border-radius:6px;cursor:pointer
+      }
+      .said-row:hover{background:#141414}
+      .said-sw{width:34px;height:18px;border-radius:9px;background:#222;border:1px solid #333;position:relative}
+      .said-sw::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#666;transition:.15s}
+      .said-row.on .said-sw{background:#fff;border-color:#fff}
+      .said-row.on .said-sw::after{transform:translateX(16px);background:#000}
+      #said-foot{padding:0 12px 10px;font-size:10px;color:#555}
+      #said-status{display:flex;align-items:center;gap:6px;padding:0 12px 8px;font-size:10px;color:#888}
+      #said-status i{width:7px;height:7px;border-radius:50%;background:#f33;display:inline-block}
+      #said-circle{
+        position:fixed;bottom:16px;right:16px;width:48px;height:48px;border-radius:50%;
+        background:#000;border:2px solid #fff;color:#fff;display:none;align-items:center;
+        justify-content:center;font:700 14px monospace;cursor:pointer;z-index:10000;
+        box-shadow:0 4px 18px rgba(0,0,0,0.55)
+      }
+      @media(max-width:600px){#said-panel{width:min(220px,calc(100vw - 20px));right:10px;top:50px}}
+    `;
+    document.documentElement.appendChild(css);
+
+    const root = document.createElement("div");
+    root.id = "said-root";
+    root.innerHTML = `
+      <div id="said-circle">S</div>
+      <div id="said-panel">
+        <div id="said-head"><b>said</b><span id="said-close">×</span></div>
+        <div id="said-status"><i id="said-dot"></i><span id="said-txt">waiting…</span></div>
+        <div id="said-body">
+          <div class="said-row" data-m="aimbot"><span>Aimbot (Head)</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="esp"><span>Box ESP</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="fly"><span>Fly</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="killaura"><span>Killaura</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="invfill"><span>Inv Fill*</span><div class="said-sw"></div></div>
+        </div>
+        <div id="said-foot">M menü · Space/Shift fly<br>*inv sunucu otoriteli</div>
+      </div>
+    `;
+    document.documentElement.appendChild(root);
+
+    statusDot = document.getElementById("said-dot");
+    statusTxt = document.getElementById("said-txt");
+
+    const panel = document.getElementById("said-panel");
+    const circle = document.getElementById("said-circle");
+    const head = document.getElementById("said-head");
+
+    function setOpen(v) {
+      state.menuOpen = v;
+      panel.style.display = v ? "block" : "none";
+      circle.style.display = v ? "none" : "flex";
+    }
+
+    document.getElementById("said-close").onclick = (e) => {
+      e.stopPropagation();
+      setOpen(false);
+    };
+    circle.onclick = () => setOpen(true);
+
+    let drag = false, ox = 0, oy = 0;
+    head.onpointerdown = (e) => {
+      if (e.target.id === "said-close") return;
+      drag = true;
+      const r = panel.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+      head.setPointerCapture(e.pointerId);
+    };
+    head.onpointermove = (e) => {
+      if (!drag) return;
+      panel.style.left = max(0, e.clientX - ox) + "px";
+      panel.style.top = max(0, e.clientY - oy) + "px";
+      panel.style.right = "auto";
+    };
+    head.onpointerup = () => { drag = false; };
+
+    root.querySelectorAll(".said-row").forEach((row) => {
+      row.onclick = () => {
+        const m = row.dataset.m;
+        state[m] = !state[m];
+        row.classList.toggle("on", state[m]);
+        if (m === "esp") {
+          ensureEsp();
+          if (!state.esp && espCtx) espCtx.clearRect(0, 0, espCanvas.width, espCanvas.height);
+        }
+      };
+    });
+
+    setOpen(true);
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // INPUT + LOOP
+  // ═══════════════════════════════════════════════════════════
+  addEventListener("keydown", (e) => {
+    if (e.code === "Space") keysDown.space = true;
+    if (e.code === "ShiftLeft" || e.code === "ShiftRight") keysDown.shift = true;
+    if (e.code === "KeyW") keysDown.w = true;
+    if (e.code === "KeyA") keysDown.a = true;
+    if (e.code === "KeyS") keysDown.s = true;
+    if (e.code === "KeyD") keysDown.d = true;
+    if (e.code === "KeyM") {
+      const panel = document.getElementById("said-panel");
+      const circle = document.getElementById("said-circle");
+      if (!panel) return;
+      state.menuOpen = !state.menuOpen;
+      panel.style.display = state.menuOpen ? "block" : "none";
+      circle.style.display = state.menuOpen ? "none" : "flex";
+    }
+  }, true);
+
+  addEventListener("keyup", (e) => {
+    if (e.code === "Space") keysDown.space = false;
+    if (e.code === "ShiftLeft" || e.code === "ShiftRight") keysDown.shift = false;
+    if (e.code === "KeyW") keysDown.w = false;
+    if (e.code === "KeyA") keysDown.a = false;
+    if (e.code === "KeyS") keysDown.s = false;
+    if (e.code === "KeyD") keysDown.d = false;
+  }, true);
+
+  function loop() {
+    if (hooks.injected) {
+      if (game.inGame()) setStatus(true);
+      tickAimbot();
+      tickKillaura();
+      tickFly();
+      drawEsp();
+    }
+    requestAnimationFrame(loop);
+  }
+
+  function boot() {
+    buildUI();
+    ensureEsp();
+    loop();
+  }
+
+  if (document.body) boot();
+  else addEventListener("DOMContentLoaded", boot);
+})();
