@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SAID Bloxd Pro
 // @namespace    said
-// @version      4.0.0
-// @description  Legit ESP + Smooth Head Aim on fire
+// @version      4.2.0
+// @description  Clean ESP | Head-only aim | Killaura | Fly fix
 // @author       said
 // @match        *://*.bloxd.io/*
 // @match        *://*.bloxd.com/*
@@ -20,18 +20,19 @@
   const { defineProperty, values, getPrototypeOf, getOwnPropertyNames, keys } = Object;
   const { hypot, atan2, sin, cos, abs, min, max, random, PI } = Math;
 
-  // legit ayarlar — snap yok, orayla vurmuş gibi
   const CFG = {
-    aimSmooth: 0.22,      // düşük = yavaş kilit, doğal
-    aimFov: 55,           // sadece nişangah yakınındakiler
-    aimRange: 22,
-    headY: 1.50,
-    kaRange: 5.8,
-    kaDelay: 95,
-    kaJitter: 0.18,
-    flySpeed: 0.48,
-    boxColor: "rgba(255,55,55,0.9)",
-    maxEsp: 70
+    aimSmooth: 0.45,
+    aimFov: 40,          // dar FOV = rastgele hedef yok
+    aimRange: 18,
+    headY: 1.48,         // tam kafa
+    pitchMin: -0.55,
+    pitchMax: 0.35,      // yukarı kaçmayı kes
+    kaRange: 5.5,
+    kaDelay: 90,
+    kaJitter: 0.12,
+    flySpeed: 0.72,
+    boxW: 0.38,          // dar kutu
+    maxEsp: 55
   };
 
   const state = {
@@ -88,7 +89,7 @@
         }
       }
     } catch {}
-  }, 800);
+  }, 700);
 
   const game = {
     _attackCache: new WeakMap(),
@@ -107,24 +108,31 @@
       try {
         const s = hooks.noa.entities.getState(id, "genericLifeformState");
         return s ? s.isAlive !== false : true;
-      } catch { return true; }
+      } catch { return false; }
     },
+    // SADECE gerçek diğer oyuncular
     getAlivePlayers() {
       try {
+        if (!this.inGame()) return [];
         const me = this.getPos(1);
         if (!me) return [];
         const raw = hooks.noa.bloxd.getPlayerIds ? hooks.noa.bloxd.getPlayerIds() : {};
-        const ids = values(raw).map(Number).filter(n => n && n !== 1);
+        if (!raw || typeof raw !== "object") return [];
+        const ids = values(raw).map(Number).filter(n => n && n !== 1 && isFinite(n));
         const out = [];
         const seen = new Set();
         for (const id of ids) {
           if (!this.isAlive(id)) continue;
           const p = this.getPos(id);
-          if (!p || !isFinite(p[0])) continue;
-          if (abs(p[0]) < 0.05 && abs(p[2]) < 0.05) continue;
+          if (!p) continue;
+          if (!isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) continue;
+          // çöp / boş entity
+          if (abs(p[0]) + abs(p[2]) < 0.2) continue;
           const d = hypot(p[0] - me[0], p[1] - me[1], p[2] - me[2]);
-          if (d < 0.5 || d > CFG.maxEsp) continue;
-          const key = p[0].toFixed(1) + "," + p[2].toFixed(1);
+          if (d < 0.8 || d > CFG.maxEsp) continue;
+          // y çok absürt = mob/prop değil player
+          if (abs(p[1] - me[1]) > 40) continue;
+          const key = id + ":" + p[0].toFixed(0) + ":" + p[2].toFixed(0);
           if (seen.has(key)) continue;
           seen.add(key);
           out.push({ id, p, d });
@@ -157,6 +165,7 @@
         if (std && typeof std.trySwingBlock === "function") std.trySwingBlock(Date.now());
       } catch {}
     },
+    // SADECE HeadMesh
     doAttack(targetId) {
       try {
         const held = this.getHeld(1);
@@ -182,10 +191,10 @@
         dx += (random() - 0.5) * CFG.kaJitter;
         dz += (random() - 0.5) * CFG.kaJitter;
         const dir = [dx / d, dy / d, dz / d];
+        // sadece kafa
         try { attackFn.call(fist, dir, String(targetId), "HeadMesh"); }
         catch {
-          try { attackFn.call(fist, dir, String(targetId), "BodyMesh"); }
-          catch { try { attackFn.call(fist, dir, String(targetId)); } catch {} }
+          try { attackFn.call(fist, dir, String(targetId), "HeadMesh"); } catch {}
         }
         this.doSwing();
       } catch {}
@@ -211,7 +220,10 @@
       }
     },
     getPhysicsBody() {
-      try { return hooks.noa.entities.getPhysics(1).body; } catch { return null; }
+      try {
+        const phys = hooks.noa.entities.getPhysics(1);
+        return phys && phys.body ? phys.body : null;
+      } catch { return null; }
     }
   };
 
@@ -219,29 +231,27 @@
     return atan2(sin(a - b), cos(a - b));
   }
 
-  // hedef seç: FOV içinde en yakın kafa (legit)
-  function pickTarget(self, cam, maxRange) {
+  function pickTarget(self, cam, maxRange, needFov) {
     const list = game.getAlivePlayers();
     const fovRad = (CFG.aimFov * PI) / 180;
     let best = null, bestScore = 1e9;
-    for (const { id, p, d } of list) {
-      if (d > maxRange) continue;
-      const hx = p[0] - self[0];
-      const hz = p[2] - self[2];
+    for (const t of list) {
+      if (t.d > maxRange) continue;
+      const hx = t.p[0] - self[0];
+      const hz = t.p[2] - self[2];
       const yaw = atan2(hx, hz);
       const yawErr = abs(angleDiff(yaw, cam.heading));
-      if (yawErr > fovRad / 2) continue;
-      // skor: açı + mesafe (nişangaha yakın öncelik)
-      const score = yawErr * 8 + d * 0.15;
+      if (needFov && yawErr > fovRad / 2) continue;
+      const score = yawErr * 10 + t.d * 0.2;
       if (score < bestScore) {
         bestScore = score;
-        best = { id, p, d };
+        best = t;
       }
     }
     return best;
   }
 
-  // SMOOTH HEAD AIM — sadece sıkınca, yavaş kilit
+  // AIMBOT — LMB, sadece kafa, pitch kilitli
   function tickAimbot() {
     if (!state.unlocked || !state.aimbot || !game.inGame()) return;
     if (!state.mouseDown) return;
@@ -250,7 +260,7 @@
     const cam = game.getCam();
     if (!self || !cam) return;
 
-    const t = pickTarget(self, cam, CFG.aimRange);
+    const t = pickTarget(self, cam, CFG.aimRange, true);
     if (!t) return;
 
     const hx = t.p[0] - self[0];
@@ -259,12 +269,14 @@
     const horiz = hypot(hx, hz) || 0.001;
     const wantYaw = atan2(hx, hz);
     let wantPitch = -atan2(hy, horiz);
-    wantPitch = max(-0.75, min(0.45, wantPitch));
+    wantPitch = max(CFG.pitchMin, min(CFG.pitchMax, wantPitch));
 
-    // yumuşak lerp — anında gitmez
     const s = CFG.aimSmooth;
     cam.heading += angleDiff(wantYaw, cam.heading) * s;
     cam.pitch += (wantPitch - cam.pitch) * s;
+    // ekstra güvenlik: pitch asla aşırı yukarı
+    if (cam.pitch < CFG.pitchMin) cam.pitch = CFG.pitchMin;
+    if (cam.pitch > CFG.pitchMax) cam.pitch = CFG.pitchMax;
   }
 
   function tickKillaura() {
@@ -274,22 +286,35 @@
     const self = game.getPos(1);
     const cam = game.getCam();
     if (!self || !cam) return;
-    // legit: sadece baktığın yöndeki yakın hedef
-    const t = pickTarget(self, cam, CFG.kaRange);
+    // yakın + bakış yönü
+    const t = pickTarget(self, cam, CFG.kaRange, true);
     if (!t) return;
     state._kaLast = now;
     game.doAttack(t.id);
   }
 
+  // FLY FIX — her frame velocity + gravity kapat
   function tickFly() {
     if (!state.unlocked || !state.fly || !game.inGame()) return;
     const body = game.getPhysicsBody();
     const cam = game.getCam();
-    if (!body || !body.velocity || !cam) return;
-    const moving = keysDown.space || keysDown.shift || keysDown.w || keysDown.a || keysDown.s || keysDown.d;
-    if (!moving) return;
-    if (keysDown.space) body.velocity[1] = CFG.flySpeed * 15;
-    else if (keysDown.shift) body.velocity[1] = -CFG.flySpeed * 15;
+    if (!body || !cam) return;
+
+    try {
+      // yerçekimi / falling kapat
+      if (body.gravity !== undefined) body.gravity = 0;
+      if (body.gravityMultiplier !== undefined) body.gravityMultiplier = 0;
+      if (typeof body.setGravity === "function") body.setGravity(0);
+    } catch {}
+
+    if (!body.velocity) return;
+
+    // dikey
+    if (keysDown.space) body.velocity[1] = CFG.flySpeed * 18;
+    else if (keysDown.shift) body.velocity[1] = -CFG.flySpeed * 18;
+    else body.velocity[1] = 0;
+
+    // yatay WASD
     let mx = 0, mz = 0;
     if (keysDown.w) { mx += sin(cam.heading); mz += cos(cam.heading); }
     if (keysDown.s) { mx -= sin(cam.heading); mz -= cos(cam.heading); }
@@ -297,9 +322,24 @@
     if (keysDown.d) { mx -= cos(cam.heading); mz += sin(cam.heading); }
     const len = hypot(mx, mz);
     if (len > 0.01) {
-      body.velocity[0] = (mx / len) * CFG.flySpeed * 13;
-      body.velocity[2] = (mz / len) * CFG.flySpeed * 13;
+      body.velocity[0] = (mx / len) * CFG.flySpeed * 16;
+      body.velocity[2] = (mz / len) * CFG.flySpeed * 16;
+    } else {
+      body.velocity[0] = 0;
+      body.velocity[2] = 0;
     }
+
+    // alternatif path: noa.ents
+    try {
+      if (hooks.noa.ents && hooks.noa.ents.getPhysics) {
+        const b2 = hooks.noa.ents.getPhysics(1);
+        if (b2 && b2.body && b2.body.velocity) {
+          b2.body.velocity[0] = body.velocity[0];
+          b2.body.velocity[1] = body.velocity[1];
+          b2.body.velocity[2] = body.velocity[2];
+        }
+      }
+    } catch {}
   }
 
   let espCanvas, espCtx;
@@ -327,13 +367,13 @@
     let y = dy;
     const y2 = y * cosP - z * sinP;
     const z2 = y * sinP + z * cosP;
-    if (z2 <= 0.2) return null;
+    if (z2 <= 0.25) return null;
     const fov = (70 * PI) / 180;
     const scale = espCanvas.height / 2 / Math.tan(fov / 2);
     const sx = espCanvas.width / 2 + (x / z2) * scale;
     const sy = espCanvas.height / 2 - (y2 / z2) * scale;
     if (!isFinite(sx) || !isFinite(sy)) return null;
-    return { x: sx, y: sy, z: z2 };
+    return { x: sx, y: sy };
   }
 
   function drawEsp() {
@@ -341,46 +381,39 @@
     espCtx.clearRect(0, 0, espCanvas.width, espCanvas.height);
     if (!state.unlocked || !state.esp || !game.inGame()) return;
 
-    espCtx.strokeStyle = CFG.boxColor;
-    espCtx.fillStyle = CFG.boxColor;
-    espCtx.lineWidth = 2;
-    espCtx.font = "11px monospace";
+    espCtx.strokeStyle = "rgba(255,50,50,0.92)";
+    espCtx.fillStyle = "rgba(255,50,50,0.92)";
+    espCtx.lineWidth = 1.8;
+    espCtx.font = "10px monospace";
 
     for (const { p, d } of game.getAlivePlayers()) {
       const foot = worldToScreen(p[0], p[1], p[2]);
-      const head = worldToScreen(p[0], p[1] + 1.68, p[2]);
+      const head = worldToScreen(p[0], p[1] + 1.65, p[2]);
       if (!foot || !head) continue;
-      const h = abs(foot.y - head.y);
-      if (h < 10 || h > 320) continue;
-      const w = h * 0.45;
-      if (w < 5) continue;
+      let h = abs(foot.y - head.y);
+      if (h < 12 || h > 220) continue;
+      // küçük kutu
+      h *= 0.92;
+      const w = max(6, h * CFG.boxW);
       const cx = (foot.x + head.x) / 2;
       const top = min(foot.y, head.y);
 
-      // ince corner box (pro görünüm)
-      const c = max(3, w * 0.25);
+      const c = max(2, w * 0.28);
       espCtx.beginPath();
-      // sol üst
       espCtx.moveTo(cx - w / 2, top + c);
       espCtx.lineTo(cx - w / 2, top);
       espCtx.lineTo(cx - w / 2 + c, top);
-      // sağ üst
       espCtx.moveTo(cx + w / 2 - c, top);
       espCtx.lineTo(cx + w / 2, top);
       espCtx.lineTo(cx + w / 2, top + c);
-      // sol alt
       espCtx.moveTo(cx - w / 2, top + h - c);
       espCtx.lineTo(cx - w / 2, top + h);
       espCtx.lineTo(cx - w / 2 + c, top + h);
-      // sağ alt
       espCtx.moveTo(cx + w / 2 - c, top + h);
       espCtx.lineTo(cx + w / 2, top + h);
       espCtx.lineTo(cx + w / 2, top + h - c);
       espCtx.stroke();
-
-      espCtx.globalAlpha = 0.85;
-      espCtx.fillText(d.toFixed(1) + "m", cx - w / 2, top - 4);
-      espCtx.globalAlpha = 1;
+      espCtx.fillText(d.toFixed(0) + "m", cx - w / 2, top - 3);
     }
   }
 
@@ -388,7 +421,7 @@
   function setStatus(ok) {
     if (!statusDot) return;
     statusDot.style.background = ok ? "#0f0" : "#f33";
-    if (statusTxt) statusTxt.textContent = ok ? "ready · " + hooks.method : "waiting…";
+    if (statusTxt) statusTxt.textContent = ok ? "ok · " + hooks.method : "waiting…";
   }
 
   function buildLock() {
@@ -397,11 +430,11 @@
     el.id = "said-lock";
     el.style.cssText = "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;font-family:monospace";
     el.innerHTML = `
-      <div style="background:#050505;border:1px solid #222;padding:22px;border-radius:10px;width:270px;text-align:center">
-        <div style="letter-spacing:5px;color:#fff;margin-bottom:14px;font-size:15px">SAID PRO</div>
-        <input id="said-pass" type="password" placeholder="password" style="width:100%;padding:10px;background:#0a0a0a;border:1px solid #2a2a2a;color:#fff;margin-bottom:8px">
-        <button id="said-go" style="width:100%;padding:10px;background:#0a0a0a;color:#ff3030;border:1px solid #ff3030;cursor:pointer;letter-spacing:1px">UNLOCK</button>
-        <div id="said-err" style="color:#f44;font-size:11px;margin-top:8px;min-height:14px"></div>
+      <div style="background:#050505;border:1px solid #222;padding:20px;border-radius:10px;width:260px;text-align:center">
+        <div style="letter-spacing:4px;color:#fff;margin-bottom:12px">SAID</div>
+        <input id="said-pass" type="password" placeholder="said12" style="width:100%;padding:10px;background:#0a0a0a;border:1px solid #2a2a2a;color:#fff;margin-bottom:8px">
+        <button id="said-go" style="width:100%;padding:10px;background:#0a0a0a;color:#ff3030;border:1px solid #ff3030;cursor:pointer">UNLOCK</button>
+        <div id="said-err" style="color:#f44;font-size:11px;margin-top:8px"></div>
       </div>`;
     document.documentElement.appendChild(el);
     function unlock() {
@@ -410,7 +443,7 @@
         el.remove();
         buildUI();
         ensureEsp();
-      } else document.getElementById("said-err").textContent = "wrong";
+      } else document.getElementById("said-err").textContent = "yanlış";
     }
     document.getElementById("said-go").onclick = unlock;
     document.getElementById("said-pass").onkeydown = e => { if (e.key === "Enter") unlock(); };
@@ -421,14 +454,13 @@
     const css = document.createElement("style");
     css.textContent = `
       #said-root{font-family:monospace;user-select:none}
-      #said-panel{position:fixed;top:58px;right:12px;width:230px;z-index:10000;background:#050505;
-        border:1px solid #1c1c1c;border-radius:8px;color:#ddd;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.7)}
-      #said-head{padding:11px 12px;border-bottom:1px solid #181818;display:flex;justify-content:space-between;align-items:center;cursor:move}
-      #said-head b{letter-spacing:4px;color:#fff;font-size:12px}
-      #said-close{width:22px;height:22px;border-radius:50%;border:1px solid #333;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px}
-      #said-body{padding:8px 10px 12px;display:flex;flex-direction:column;gap:5px}
-      .said-row{display:flex;justify-content:space-between;align-items:center;padding:9px 10px;background:#0a0a0a;border:1px solid #161616;border-radius:5px;cursor:pointer;font-size:12px}
-      .said-row:hover{border-color:#2a2a2a}
+      #said-panel{position:fixed;top:58px;right:12px;width:220px;z-index:10000;background:#050505;
+        border:1px solid #1c1c1c;border-radius:8px;color:#ddd;overflow:hidden}
+      #said-head{padding:10px 12px;border-bottom:1px solid #181818;display:flex;justify-content:space-between;cursor:move}
+      #said-head b{letter-spacing:3px;color:#fff}
+      #said-close{width:22px;height:22px;border-radius:50%;border:1px solid #333;display:flex;align-items:center;justify-content:center;cursor:pointer}
+      #said-body{padding:8px 10px;display:flex;flex-direction:column;gap:5px}
+      .said-row{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:#0a0a0a;border:1px solid #161616;border-radius:5px;cursor:pointer;font-size:12px}
       .said-sw{width:32px;height:16px;border-radius:8px;background:#1a1a1a;position:relative}
       .said-sw::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#555;transition:.15s}
       .said-row.on .said-sw{background:#c02020}
@@ -436,24 +468,23 @@
       #said-status{display:flex;align-items:center;gap:6px;padding:0 12px 8px;font-size:10px;color:#555}
       #said-status i{width:6px;height:6px;border-radius:50%;background:#f33;display:inline-block}
       #said-circle{position:fixed;bottom:14px;right:14px;width:44px;height:44px;border-radius:50%;background:#050505;border:1px solid #c02020;color:#c02020;display:none;align-items:center;justify-content:center;font:700 11px monospace;cursor:pointer;z-index:10000}
-      #said-foot{padding:0 12px 10px;font-size:9px;color:#333;line-height:1.4}
+      #said-foot{padding:0 12px 10px;font-size:9px;color:#333}
     `;
     document.documentElement.appendChild(css);
-
     const root = document.createElement("div");
     root.id = "said-root";
     root.innerHTML = `
       <div id="said-circle">S</div>
       <div id="said-panel">
-        <div id="said-head"><b>SAID PRO</b><span id="said-close">×</span></div>
+        <div id="said-head"><b>SAID</b><span id="said-close">×</span></div>
         <div id="said-status"><i id="said-dot"></i><span id="said-txt">waiting…</span></div>
         <div id="said-body">
           <div class="said-row" data-m="esp"><span>ESP</span><div class="said-sw"></div></div>
-          <div class="said-row" data-m="aimbot"><span>Aim Assist (LMB)</span><div class="said-sw"></div></div>
-          <div class="said-row" data-m="killaura"><span>Aura</span><div class="said-sw"></div></div>
-          <div class="said-row" data-m="fly"><span>Fly</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="aimbot"><span>HS Aim (LMB)</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="killaura"><span>Kill Aura</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="fly"><span>Fly WASD</span><div class="said-sw"></div></div>
         </div>
-        <div id="said-foot">M menü · aim sadece ateşte · FOV 55° smooth</div>
+        <div id="said-foot">M menü · Space↑ Shift↓ · sadece kafa HS</div>
       </div>`;
     document.documentElement.appendChild(root);
 
@@ -501,7 +532,7 @@
   addEventListener("mouseup", e => { if (e.button === 0) state.mouseDown = false; }, true);
 
   addEventListener("keydown", e => {
-    if (e.code === "Space") keysDown.space = true;
+    if (e.code === "Space") { keysDown.space = true; if (state.fly) e.preventDefault(); }
     if (e.code === "ShiftLeft" || e.code === "ShiftRight") keysDown.shift = true;
     if (e.code === "KeyW") keysDown.w = true;
     if (e.code === "KeyA") keysDown.a = true;
