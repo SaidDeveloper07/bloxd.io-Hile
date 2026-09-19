@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SAID Bloxd
+// @name         SAID Bloxd Pro
 // @namespace    said
-// @version      3.2.0
-// @description  Red Box ESP | Aimbot | Killaura | WASD Fly
+// @version      4.0.0
+// @description  Legit ESP + Smooth Head Aim on fire
 // @author       said
 // @match        *://*.bloxd.io/*
 // @match        *://*.bloxd.com/*
@@ -16,27 +16,32 @@
 (() => {
   "use strict";
 
+  const PASS = "said12";
   const { defineProperty, values, getPrototypeOf, getOwnPropertyNames, keys } = Object;
   const { hypot, atan2, sin, cos, abs, min, max, random, PI } = Math;
 
+  // legit ayarlar — snap yok, orayla vurmuş gibi
   const CFG = {
-    aimSmooth: 0.85,
-    aimRange: 30,
-    kaRange: 6.5,
-    kaDelay: 60,
-    kaJitter: 0.3,
-    flySpeed: 0.55,
-    boxColor: "#ff2020",
-    boxLine: 2.5,
-    farBoost: 1.35
+    aimSmooth: 0.22,      // düşük = yavaş kilit, doğal
+    aimFov: 55,           // sadece nişangah yakınındakiler
+    aimRange: 22,
+    headY: 1.50,
+    kaRange: 5.8,
+    kaDelay: 95,
+    kaJitter: 0.18,
+    flySpeed: 0.48,
+    boxColor: "rgba(255,55,55,0.9)",
+    maxEsp: 70
   };
 
   const state = {
-    esp: true,
-    aimbot: true,
-    killaura: true,
-    fly: true,
+    unlocked: false,
+    esp: false,
+    aimbot: false,
+    killaura: false,
+    fly: false,
     menuOpen: true,
+    mouseDown: false,
     _kaLast: 0
   };
 
@@ -49,7 +54,6 @@
     hooks.injected = true;
     hooks.method = method;
     window.noa = n;
-    console.log("%c[SAID]%c " + method, "background:#000;color:#f22;padding:2px 6px", "color:#0f0");
     setStatus(true);
   }
 
@@ -74,10 +78,7 @@
 
   setInterval(() => {
     if (hooks.injected) return;
-    if (window.noa && window.noa.entities && window.noa.bloxd) {
-      onNoa(window.noa, "window.noa");
-      return;
-    }
+    if (window.noa && window.noa.entities && window.noa.bloxd) return onNoa(window.noa, "window.noa");
     try {
       for (const k of keys(window)) {
         const v = window[k];
@@ -87,7 +88,7 @@
         }
       }
     } catch {}
-  }, 700);
+  }, 800);
 
   const game = {
     _attackCache: new WeakMap(),
@@ -110,8 +111,25 @@
     },
     getAlivePlayers() {
       try {
+        const me = this.getPos(1);
+        if (!me) return [];
         const raw = hooks.noa.bloxd.getPlayerIds ? hooks.noa.bloxd.getPlayerIds() : {};
-        return values(raw).map(Number).filter(n => n && n !== 1 && this.isAlive(n));
+        const ids = values(raw).map(Number).filter(n => n && n !== 1);
+        const out = [];
+        const seen = new Set();
+        for (const id of ids) {
+          if (!this.isAlive(id)) continue;
+          const p = this.getPos(id);
+          if (!p || !isFinite(p[0])) continue;
+          if (abs(p[0]) < 0.05 && abs(p[2]) < 0.05) continue;
+          const d = hypot(p[0] - me[0], p[1] - me[1], p[2] - me[2]);
+          if (d < 0.5 || d > CFG.maxEsp) continue;
+          const key = p[0].toFixed(1) + "," + p[2].toFixed(1);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ id, p, d });
+        }
+        return out;
       } catch { return []; }
     },
     getHeld(id = 1) {
@@ -158,7 +176,7 @@
         const targ = this.getPos(targetId);
         if (!self || !targ) return;
         let dx = targ[0] - self[0];
-        let dy = targ[1] - self[1] + 1.55;
+        let dy = targ[1] - self[1] + CFG.headY;
         let dz = targ[2] - self[2];
         const d = hypot(dx, dy, dz) || 1;
         dx += (random() - 0.5) * CFG.kaJitter;
@@ -175,6 +193,23 @@
     getCam() {
       return hooks.noa && hooks.noa.camera ? hooks.noa.camera : null;
     },
+    getCamPos() {
+      try {
+        const cam = this.getCam();
+        if (cam && typeof cam.getPosition === "function") {
+          const p = cam.getPosition();
+          if (p && isFinite(p[0])) return [p[0], p[1], p[2]];
+        }
+        if (cam && cam.position && isFinite(cam.position[0])) {
+          return [cam.position[0], cam.position[1], cam.position[2]];
+        }
+        const me = this.getPos(1);
+        return me ? [me[0], me[1] + 1.55, me[2]] : null;
+      } catch {
+        const me = this.getPos(1);
+        return me ? [me[0], me[1] + 1.55, me[2]] : null;
+      }
+    },
     getPhysicsBody() {
       try { return hooks.noa.entities.getPhysics(1).body; } catch { return null; }
     }
@@ -183,177 +218,202 @@
   function angleDiff(a, b) {
     return atan2(sin(a - b), cos(a - b));
   }
-  function dist(a, b) {
-    if (!a || !b) return 1e9;
-    return hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+  // hedef seç: FOV içinde en yakın kafa (legit)
+  function pickTarget(self, cam, maxRange) {
+    const list = game.getAlivePlayers();
+    const fovRad = (CFG.aimFov * PI) / 180;
+    let best = null, bestScore = 1e9;
+    for (const { id, p, d } of list) {
+      if (d > maxRange) continue;
+      const hx = p[0] - self[0];
+      const hz = p[2] - self[2];
+      const yaw = atan2(hx, hz);
+      const yawErr = abs(angleDiff(yaw, cam.heading));
+      if (yawErr > fovRad / 2) continue;
+      // skor: açı + mesafe (nişangaha yakın öncelik)
+      const score = yawErr * 8 + d * 0.15;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { id, p, d };
+      }
+    }
+    return best;
   }
 
-  // AIMBOT kafa
+  // SMOOTH HEAD AIM — sadece sıkınca, yavaş kilit
   function tickAimbot() {
-    if (!state.aimbot || !game.inGame()) return;
+    if (!state.unlocked || !state.aimbot || !game.inGame()) return;
+    if (!state.mouseDown) return;
+
     const self = game.getPos(1);
     const cam = game.getCam();
     if (!self || !cam) return;
-    let best = null, bestD = CFG.aimRange;
-    for (const id of game.getAlivePlayers()) {
-      const p = game.getPos(id);
-      if (!p) continue;
-      const d = dist(self, p);
-      if (d < bestD) { bestD = d; best = p; }
-    }
-    if (!best) return;
-    const hx = best[0] - self[0];
-    const hy = best[1] + 1.55 - self[1];
-    const hz = best[2] - self[2];
+
+    const t = pickTarget(self, cam, CFG.aimRange);
+    if (!t) return;
+
+    const hx = t.p[0] - self[0];
+    const hy = t.p[1] + CFG.headY - self[1];
+    const hz = t.p[2] - self[2];
+    const horiz = hypot(hx, hz) || 0.001;
     const wantYaw = atan2(hx, hz);
-    const wantPitch = -atan2(hy, hypot(hx, hz));
-    cam.heading += angleDiff(wantYaw, cam.heading) * CFG.aimSmooth;
-    cam.pitch += (max(-1.55, min(1.55, wantPitch)) - cam.pitch) * CFG.aimSmooth;
+    let wantPitch = -atan2(hy, horiz);
+    wantPitch = max(-0.75, min(0.45, wantPitch));
+
+    // yumuşak lerp — anında gitmez
+    const s = CFG.aimSmooth;
+    cam.heading += angleDiff(wantYaw, cam.heading) * s;
+    cam.pitch += (wantPitch - cam.pitch) * s;
   }
 
-  // KILL AURA
   function tickKillaura() {
-    if (!state.killaura || !game.inGame()) return;
+    if (!state.unlocked || !state.killaura || !game.inGame()) return;
     const now = Date.now();
     if (now - state._kaLast < CFG.kaDelay) return;
     const self = game.getPos(1);
-    if (!self) return;
-    let closest = null, closestD = CFG.kaRange;
-    for (const id of game.getAlivePlayers()) {
-      const p = game.getPos(id);
-      if (!p) continue;
-      const d = dist(self, p);
-      if (d < closestD) { closestD = d; closest = id; }
-    }
-    if (closest != null) {
-      state._kaLast = now;
-      game.doAttack(closest);
-    }
+    const cam = game.getCam();
+    if (!self || !cam) return;
+    // legit: sadece baktığın yöndeki yakın hedef
+    const t = pickTarget(self, cam, CFG.kaRange);
+    if (!t) return;
+    state._kaLast = now;
+    game.doAttack(t.id);
   }
 
-  // FLY — Space yukarı, Shift aşağı, WASD yatay
   function tickFly() {
-    if (!state.fly || !game.inGame()) return;
+    if (!state.unlocked || !state.fly || !game.inGame()) return;
     const body = game.getPhysicsBody();
-    if (!body || !body.velocity) return;
     const cam = game.getCam();
-    if (!cam) return;
-
-    if (keysDown.space) body.velocity[1] = CFG.flySpeed * 16;
-    else if (keysDown.shift) body.velocity[1] = -CFG.flySpeed * 16;
-    else body.velocity[1] = 0;
-
+    if (!body || !body.velocity || !cam) return;
+    const moving = keysDown.space || keysDown.shift || keysDown.w || keysDown.a || keysDown.s || keysDown.d;
+    if (!moving) return;
+    if (keysDown.space) body.velocity[1] = CFG.flySpeed * 15;
+    else if (keysDown.shift) body.velocity[1] = -CFG.flySpeed * 15;
     let mx = 0, mz = 0;
     if (keysDown.w) { mx += sin(cam.heading); mz += cos(cam.heading); }
     if (keysDown.s) { mx -= sin(cam.heading); mz -= cos(cam.heading); }
     if (keysDown.a) { mx += cos(cam.heading); mz -= sin(cam.heading); }
     if (keysDown.d) { mx -= cos(cam.heading); mz += sin(cam.heading); }
-    const len = hypot(mx, mz) || 1;
-    if (keysDown.w || keysDown.a || keysDown.s || keysDown.d) {
-      body.velocity[0] = (mx / len) * CFG.flySpeed * 14;
-      body.velocity[2] = (mz / len) * CFG.flySpeed * 14;
+    const len = hypot(mx, mz);
+    if (len > 0.01) {
+      body.velocity[0] = (mx / len) * CFG.flySpeed * 13;
+      body.velocity[2] = (mz / len) * CFG.flySpeed * 13;
     }
   }
 
-  // ESP — her frame kamera + oyuncu pozisyonundan yeniden projeksiyon
-  // sen hareket edince kutu oyuncunun üzerinde kalır (world-locked)
   let espCanvas, espCtx;
   function ensureEsp() {
     if (espCanvas) return;
     espCanvas = document.createElement("canvas");
     espCanvas.id = "said-esp";
-    espCanvas.style.cssText = "position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:9998;";
+    espCanvas.style.cssText = "position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:9998";
     (document.body || document.documentElement).appendChild(espCanvas);
     espCtx = espCanvas.getContext("2d");
-    const resize = () => {
-      espCanvas.width = innerWidth;
-      espCanvas.height = innerHeight;
-    };
+    const resize = () => { espCanvas.width = innerWidth; espCanvas.height = innerHeight; };
     resize();
     addEventListener("resize", resize);
   }
 
-  // world pozisyon → ekran (anlık kamera ile — kutu oyuncuya yapışık kalır)
   function worldToScreen(wx, wy, wz) {
     const cam = game.getCam();
-    const self = game.getPos(1);
-    if (!cam || !self || !espCanvas) return null;
-
-    const dx = wx - self[0];
-    const dy = wy - self[1];
-    const dz = wz - self[2];
-
+    const origin = game.getCamPos();
+    if (!cam || !origin || !espCanvas) return null;
+    const dx = wx - origin[0], dy = wy - origin[1], dz = wz - origin[2];
     const cosH = cos(-cam.heading), sinH = sin(-cam.heading);
     const cosP = cos(-cam.pitch), sinP = sin(-cam.pitch);
-
     let x = dx * cosH - dz * sinH;
     let z = dx * sinH + dz * cosH;
     let y = dy;
     const y2 = y * cosP - z * sinP;
     const z2 = y * sinP + z * cosP;
-    if (z2 <= 0.08) return null;
-
+    if (z2 <= 0.2) return null;
     const fov = (70 * PI) / 180;
-    const scale = (espCanvas.height / 2 / Math.tan(fov / 2)) * CFG.farBoost;
-    return {
-      x: espCanvas.width / 2 + (x / z2) * scale,
-      y: espCanvas.height / 2 - (y2 / z2) * scale,
-      z: z2
-    };
+    const scale = espCanvas.height / 2 / Math.tan(fov / 2);
+    const sx = espCanvas.width / 2 + (x / z2) * scale;
+    const sy = espCanvas.height / 2 - (y2 / z2) * scale;
+    if (!isFinite(sx) || !isFinite(sy)) return null;
+    return { x: sx, y: sy, z: z2 };
   }
 
   function drawEsp() {
     if (!espCtx) return;
     espCtx.clearRect(0, 0, espCanvas.width, espCanvas.height);
-    if (!state.esp || !game.inGame()) return;
-
-    const me = game.getPos(1);
-    if (!me) return;
+    if (!state.unlocked || !state.esp || !game.inGame()) return;
 
     espCtx.strokeStyle = CFG.boxColor;
     espCtx.fillStyle = CFG.boxColor;
-    espCtx.lineWidth = CFG.boxLine;
-    espCtx.font = "bold 12px monospace";
+    espCtx.lineWidth = 2;
+    espCtx.font = "11px monospace";
 
-    for (const id of game.getAlivePlayers()) {
-      const p = game.getPos(id);
-      if (!p) continue;
-
-      // her kare dünya koordinatından çiz → sen hareket edince kutu oyuncuda kalır
+    for (const { p, d } of game.getAlivePlayers()) {
       const foot = worldToScreen(p[0], p[1], p[2]);
-      const head = worldToScreen(p[0], p[1] + 1.75, p[2]);
+      const head = worldToScreen(p[0], p[1] + 1.68, p[2]);
       if (!foot || !head) continue;
-
       const h = abs(foot.y - head.y);
-      if (h < 4) continue;
-      const w = h * 0.5;
+      if (h < 10 || h > 320) continue;
+      const w = h * 0.45;
+      if (w < 5) continue;
       const cx = (foot.x + head.x) / 2;
       const top = min(foot.y, head.y);
 
-      // kırmızı kutu
-      espCtx.globalAlpha = 0.95;
-      espCtx.strokeRect(cx - w / 2, top, w, h);
-      // köşe vurgusu
-      const c = 6;
+      // ince corner box (pro görünüm)
+      const c = max(3, w * 0.25);
       espCtx.beginPath();
-      espCtx.moveTo(cx - w / 2, top + c); espCtx.lineTo(cx - w / 2, top); espCtx.lineTo(cx - w / 2 + c, top);
-      espCtx.moveTo(cx + w / 2, top + c); espCtx.lineTo(cx + w / 2, top); espCtx.lineTo(cx + w / 2 - c, top);
-      espCtx.moveTo(cx - w / 2, top + h - c); espCtx.lineTo(cx - w / 2, top + h); espCtx.lineTo(cx - w / 2 + c, top + h);
-      espCtx.moveTo(cx + w / 2, top + h - c); espCtx.lineTo(cx + w / 2, top + h); espCtx.lineTo(cx + w / 2 - c, top + h);
+      // sol üst
+      espCtx.moveTo(cx - w / 2, top + c);
+      espCtx.lineTo(cx - w / 2, top);
+      espCtx.lineTo(cx - w / 2 + c, top);
+      // sağ üst
+      espCtx.moveTo(cx + w / 2 - c, top);
+      espCtx.lineTo(cx + w / 2, top);
+      espCtx.lineTo(cx + w / 2, top + c);
+      // sol alt
+      espCtx.moveTo(cx - w / 2, top + h - c);
+      espCtx.lineTo(cx - w / 2, top + h);
+      espCtx.lineTo(cx - w / 2 + c, top + h);
+      // sağ alt
+      espCtx.moveTo(cx + w / 2 - c, top + h);
+      espCtx.lineTo(cx + w / 2, top + h);
+      espCtx.lineTo(cx + w / 2, top + h - c);
       espCtx.stroke();
 
-      const d = dist(me, p);
+      espCtx.globalAlpha = 0.85;
       espCtx.fillText(d.toFixed(1) + "m", cx - w / 2, top - 4);
+      espCtx.globalAlpha = 1;
     }
-    espCtx.globalAlpha = 1;
   }
 
-  // SAID menü
   let statusDot, statusTxt;
   function setStatus(ok) {
     if (!statusDot) return;
     statusDot.style.background = ok ? "#0f0" : "#f33";
-    if (statusTxt) statusTxt.textContent = ok ? "ok · " + hooks.method : "waiting…";
+    if (statusTxt) statusTxt.textContent = ok ? "ready · " + hooks.method : "waiting…";
+  }
+
+  function buildLock() {
+    if (document.getElementById("said-lock")) return;
+    const el = document.createElement("div");
+    el.id = "said-lock";
+    el.style.cssText = "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;font-family:monospace";
+    el.innerHTML = `
+      <div style="background:#050505;border:1px solid #222;padding:22px;border-radius:10px;width:270px;text-align:center">
+        <div style="letter-spacing:5px;color:#fff;margin-bottom:14px;font-size:15px">SAID PRO</div>
+        <input id="said-pass" type="password" placeholder="password" style="width:100%;padding:10px;background:#0a0a0a;border:1px solid #2a2a2a;color:#fff;margin-bottom:8px">
+        <button id="said-go" style="width:100%;padding:10px;background:#0a0a0a;color:#ff3030;border:1px solid #ff3030;cursor:pointer;letter-spacing:1px">UNLOCK</button>
+        <div id="said-err" style="color:#f44;font-size:11px;margin-top:8px;min-height:14px"></div>
+      </div>`;
+    document.documentElement.appendChild(el);
+    function unlock() {
+      if ((document.getElementById("said-pass").value || "").trim() === PASS) {
+        state.unlocked = true;
+        el.remove();
+        buildUI();
+        ensureEsp();
+      } else document.getElementById("said-err").textContent = "wrong";
+    }
+    document.getElementById("said-go").onclick = unlock;
+    document.getElementById("said-pass").onkeydown = e => { if (e.key === "Enter") unlock(); };
   }
 
   function buildUI() {
@@ -361,29 +421,22 @@
     const css = document.createElement("style");
     css.textContent = `
       #said-root{font-family:monospace;user-select:none}
-      #said-panel{position:fixed;top:60px;right:12px;width:220px;z-index:10000;
-        background:#000;border:1px solid #222;border-radius:8px;color:#fff;
-        box-shadow:0 8px 28px rgba(0,0,0,.75);overflow:hidden}
-      #said-head{padding:10px 12px;border-bottom:1px solid #1a1a1a;display:flex;
-        align-items:center;justify-content:space-between;cursor:move}
-      #said-head b{letter-spacing:3px}
-      #said-close{width:22px;height:22px;border-radius:50%;background:#111;border:1px solid #333;
-        display:flex;align-items:center;justify-content:center;cursor:pointer}
-      #said-body{padding:8px 10px 12px;display:flex;flex-direction:column;gap:6px}
-      .said-row{display:flex;align-items:center;justify-content:space-between;padding:9px 10px;
-        background:#0a0a0a;border:1px solid #1a1a1a;border-radius:6px;cursor:pointer}
-      .said-row:hover{background:#121212}
-      .said-sw{width:34px;height:18px;border-radius:9px;background:#222;border:1px solid #333;position:relative}
-      .said-sw::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;
-        border-radius:50%;background:#666;transition:.15s}
-      .said-row.on .said-sw{background:#ff2020;border-color:#ff2020}
-      .said-row.on .said-sw::after{transform:translateX(16px);background:#000}
-      #said-status{display:flex;align-items:center;gap:6px;padding:0 12px 8px;font-size:10px;color:#666}
-      #said-status i{width:7px;height:7px;border-radius:50%;background:#f33;display:inline-block}
-      #said-circle{position:fixed;bottom:16px;right:16px;width:48px;height:48px;border-radius:50%;
-        background:#000;border:2px solid #ff2020;color:#ff2020;display:none;align-items:center;
-        justify-content:center;font:700 13px monospace;cursor:pointer;z-index:10000}
-      #said-foot{padding:0 12px 10px;font-size:10px;color:#444}
+      #said-panel{position:fixed;top:58px;right:12px;width:230px;z-index:10000;background:#050505;
+        border:1px solid #1c1c1c;border-radius:8px;color:#ddd;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.7)}
+      #said-head{padding:11px 12px;border-bottom:1px solid #181818;display:flex;justify-content:space-between;align-items:center;cursor:move}
+      #said-head b{letter-spacing:4px;color:#fff;font-size:12px}
+      #said-close{width:22px;height:22px;border-radius:50%;border:1px solid #333;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px}
+      #said-body{padding:8px 10px 12px;display:flex;flex-direction:column;gap:5px}
+      .said-row{display:flex;justify-content:space-between;align-items:center;padding:9px 10px;background:#0a0a0a;border:1px solid #161616;border-radius:5px;cursor:pointer;font-size:12px}
+      .said-row:hover{border-color:#2a2a2a}
+      .said-sw{width:32px;height:16px;border-radius:8px;background:#1a1a1a;position:relative}
+      .said-sw::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#555;transition:.15s}
+      .said-row.on .said-sw{background:#c02020}
+      .said-row.on .said-sw::after{transform:translateX(16px);background:#fff}
+      #said-status{display:flex;align-items:center;gap:6px;padding:0 12px 8px;font-size:10px;color:#555}
+      #said-status i{width:6px;height:6px;border-radius:50%;background:#f33;display:inline-block}
+      #said-circle{position:fixed;bottom:14px;right:14px;width:44px;height:44px;border-radius:50%;background:#050505;border:1px solid #c02020;color:#c02020;display:none;align-items:center;justify-content:center;font:700 11px monospace;cursor:pointer;z-index:10000}
+      #said-foot{padding:0 12px 10px;font-size:9px;color:#333;line-height:1.4}
     `;
     document.documentElement.appendChild(css);
 
@@ -392,17 +445,16 @@
     root.innerHTML = `
       <div id="said-circle">S</div>
       <div id="said-panel">
-        <div id="said-head"><b>SAID</b><span id="said-close">×</span></div>
+        <div id="said-head"><b>SAID PRO</b><span id="said-close">×</span></div>
         <div id="said-status"><i id="said-dot"></i><span id="said-txt">waiting…</span></div>
         <div id="said-body">
-          <div class="said-row on" data-m="esp"><span>ESP Kırmızı</span><div class="said-sw"></div></div>
-          <div class="said-row on" data-m="aimbot"><span>Aimbot Kafa</span><div class="said-sw"></div></div>
-          <div class="said-row on" data-m="killaura"><span>Kill Aura</span><div class="said-sw"></div></div>
-          <div class="said-row on" data-m="fly"><span>Fly WASD</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="esp"><span>ESP</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="aimbot"><span>Aim Assist (LMB)</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="killaura"><span>Aura</span><div class="said-sw"></div></div>
+          <div class="said-row" data-m="fly"><span>Fly</span><div class="said-sw"></div></div>
         </div>
-        <div id="said-foot">M menü · Space↑ Shift↓ · WASD uç</div>
-      </div>
-    `;
+        <div id="said-foot">M menü · aim sadece ateşte · FOV 55° smooth</div>
+      </div>`;
     document.documentElement.appendChild(root);
 
     statusDot = document.getElementById("said-dot");
@@ -445,6 +497,9 @@
     setOpen(true);
   }
 
+  addEventListener("mousedown", e => { if (e.button === 0) state.mouseDown = true; }, true);
+  addEventListener("mouseup", e => { if (e.button === 0) state.mouseDown = false; }, true);
+
   addEventListener("keydown", e => {
     if (e.code === "Space") keysDown.space = true;
     if (e.code === "ShiftLeft" || e.code === "ShiftRight") keysDown.shift = true;
@@ -452,7 +507,7 @@
     if (e.code === "KeyA") keysDown.a = true;
     if (e.code === "KeyS") keysDown.s = true;
     if (e.code === "KeyD") keysDown.d = true;
-    if (e.code === "KeyM") {
+    if (e.code === "KeyM" && state.unlocked) {
       const panel = document.getElementById("said-panel");
       const circle = document.getElementById("said-circle");
       if (!panel) return;
@@ -472,7 +527,7 @@
   }, true);
 
   function loop() {
-    if (hooks.injected && game.inGame()) {
+    if (hooks.injected && game.inGame() && state.unlocked) {
       setStatus(true);
       tickAimbot();
       tickKillaura();
@@ -483,8 +538,7 @@
   }
 
   function boot() {
-    buildUI();
-    ensureEsp();
+    buildLock();
     loop();
   }
   if (document.body) boot();
